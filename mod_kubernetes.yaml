@@ -7,7 +7,7 @@ metadata:
 spec:
   containers:
   - name: kubernetes-pause
-    image: quay.io/jfclere/fedora:myhttpd
+    image: quay.io/jfclere/fedora
     command:
     - mod_kubernetes
     - tomcat
