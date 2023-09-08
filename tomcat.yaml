@@ -1,0 +1,22 @@
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: tomcat
+  labels:
+    run: tomcat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      run: tomcat
+  template:
+    metadata:
+      creationTimestamp:
+      labels:
+        run: tomcat
+    spec:
+      containers:
+      - name: tomcat
+        image: quay.io/jfclere/tomcat
+        ports:
+        - containerPort: 8080
