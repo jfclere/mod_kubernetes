@@ -1,0 +1,19 @@
+APACHE_BASE = @APACHE_BASE@
+top_builddir = @APACHE_BUILDDIR@
+# For .deps.
+builddir = @CLUSTER_BASE@
+
+include $(top_builddir)/build/rules.mk
+SH_COMPILE = $(LIBTOOL) --mode=compile $(BASE_CC) -I../include -prefer-pic -c $< && touch $@
+
+all: mod_kubernetes.so
+
+mod_kubernetes.so: mod_kubernetes.la
+	$(top_builddir)/build/instdso.sh SH_LIBTOOL='$(LIBTOOL)' mod_kubernetes.la `pwd`
+
+mod_kubernetes.la: mod_kubernetes.slo
+	$(SH_LINK) -rpath $(libexecdir) -module -avoid-version mod_kubernetes.lo
+
+clean:
+	rm -f *.o *.lo *.slo *.so
+	rm -rf .libs
