@@ -44,7 +44,7 @@ static struct proxy_node_table *kubernetes_watchdog_func(const char *servicename
             char *ip_addr;
             struct proxy_node_table *ctable = table;
             apr_sockaddr_ip_get(&ip_addr, sa);
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "kubernetes_watchdog_func: find address %s %s %s",
+            ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "kubernetes_watchdog_func: find address %s %s %s",
                          ip_addr, sa->hostname,  sa->servname);
             if (ctable) {
                 ctable->next = apr_pcalloc(pool, sizeof(struct proxy_node_table));
@@ -58,7 +58,7 @@ static struct proxy_node_table *kubernetes_watchdog_func(const char *servicename
             sa = sa->next;
         }
     } else
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "kubernetes_watchdog_func:  No pod for the service: %s", servicename);
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "kubernetes_watchdog_func:  No pod for the service: %s", servicename);
     apr_pool_destroy(ptemp);
     return table;
 }
@@ -191,7 +191,8 @@ static void addworkersfromtable(struct proxy_node_table *node_table, apr_pool_t 
         if (!ctable->alreadyin) {
             request_rec *r;
             r = create_request_rec(p, s, balancer, "GET", "http" );
-            mod_manager_manage_worker(r, ctable->host, balancer->s->name);
+            ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "addworkersfromtable: %s add to %s", ctable->host, &balancer->s->name[11]);
+            mod_manager_manage_worker(r, ctable->host, &balancer->s->name[11]);
         }
         ctable = ctable->next;
     }
@@ -200,15 +201,17 @@ static void remove_worker(apr_pool_t *p, server_rec *s, proxy_balancer *balancer
 {
     request_rec *r;
     apr_table_t *params;
+    ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "remove_worker: removing %s from %s", hostname, &balancer->s->name[11]);
     r = create_request_rec(p, s, balancer, "GET", "http" );
-    apr_table_set(params, "b", balancer->s->name);
+    params = apr_table_make(r->pool, 10);
+    apr_table_set(params, "b", &balancer->s->name[11]);
     apr_table_set(params, "w",
                   apr_pstrcat(r->pool, Type, "://", hostname, ":", Port, NULL));
     apr_table_set(params, "w_status_D", "1"); /* Dissabled */
     apr_table_set(params, "w_status_S", "1"); /* Stopped */
 
     balancer_manage(r, params);
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "remove_worker: %s removed", hostname);
+    ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "remove_worker: %s removed", hostname);
 }
 
 /* check if the worker is in the pod list otherwise add it to the toremove list */
@@ -235,7 +238,7 @@ static apr_status_t k8s_watchdog_callback(int state, void *data, apr_pool_t *poo
     apr_time_t now;
     switch (state) {
     case AP_WATCHDOG_STATE_STARTING:
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "k8s_watchdog_callback STARTING");
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "k8s_watchdog_callback STARTING");
         break;
 
     case AP_WATCHDOG_STATE_RUNNING:
@@ -247,6 +250,7 @@ static apr_status_t k8s_watchdog_callback(int state, void *data, apr_pool_t *poo
         now = apr_time_now();
         if (now - last < interval)
             return rv;
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, s, "k8s_watchdog_callback RUNNING");
         last = now;
         node_table = kubernetes_watchdog_func("tomcat", pool, s);
 
@@ -266,8 +270,6 @@ static apr_status_t k8s_watchdog_callback(int state, void *data, apr_pool_t *poo
                 workers++;
             }
             /* add the new pods */
-            node_table = apr_pcalloc(pool, sizeof(struct proxy_node_table));
-            node_table->host = apr_pstrdup(pool, "10.131.0.33");
             addworkersfromtable(node_table, pool, s, balancer);
         }
 
