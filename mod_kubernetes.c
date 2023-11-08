@@ -25,11 +25,6 @@ struct proxy_node_table {
    struct proxy_node_table *next;
 };
 
-struct proxy_worker_table {
-   proxy_worker *worker;
-   struct proxy_worker_table *next;
-};
-
 static ap_watchdog_t *watchdog;
 static apr_time_t last = 0;
 static apr_time_t interval = apr_time_from_sec(HCHECK_WATHCHDOG_DEFAULT_INTERVAL);
@@ -54,8 +49,10 @@ static struct proxy_node_table *kubernetes_watchdog_func(const char *servicename
             if (ctable) {
                 ctable->next = apr_pcalloc(pool, sizeof(struct proxy_node_table));
                 ctable = ctable->next;
-            } else
+            } else {
                 ctable = apr_pcalloc(pool, sizeof(struct proxy_node_table));
+                table = ctable;
+            }
             ctable->host = apr_pstrdup(pool, ip_addr);
             
             sa = sa->next;
@@ -71,8 +68,8 @@ static struct proxy_node_table *kubernetes_watchdog_func(const char *servicename
  * Builds the parameters for mod_balancer
  */
 #define Type "http"
-#define Port 8080
-static apr_status_t mod_manager_manage_worker(request_rec *r, const char *balancer, const char *hostname)
+#define Port "8080"
+static apr_status_t mod_manager_manage_worker(request_rec *r, const char *hostname, const char *balancer)
 {
     apr_table_t *params;
     params = apr_table_make(r->pool, 10);
@@ -105,40 +102,128 @@ static apr_status_t mod_manager_manage_worker(request_rec *r, const char *balanc
     return balancer_manage(r, params);
 }
 
-static void remove_removed_node(server_rec *s, apr_pool_t *pool, apr_time_t now, struct proxy_worker_table *worker_table)
+
+/* (copied from mod_proxy_hcheck.c)
+ * Create a dummy request rec, simply so we can use ap_expr.
+ * Use our short-lived pool for bucket_alloc so that we can simply move
+ * buckets and use them after the backend connection is released.
+ */
+static request_rec *create_request_rec(apr_pool_t *p, server_rec *s,
+                                       proxy_balancer *balancer,
+                                       const char *method,
+                                       const char *protocol)
 {
-    /* Calls mod_manager_manage_worker */
+    request_rec *r;
+
+    r = apr_pcalloc(p, sizeof(request_rec));
+    r->pool            = p;
+    r->server          = s;
+
+    r->per_dir_config = r->server->lookup_defaults;
+    if (balancer->section_config) {
+        r->per_dir_config = ap_merge_per_dir_configs(r->pool,
+                                                     r->per_dir_config,
+                                                     balancer->section_config);
+    }
+
+    r->proxyreq        = PROXYREQ_RESPONSE;
+
+    r->user            = NULL;
+    r->ap_auth_type    = NULL;
+
+    r->allowed_methods = ap_make_method_list(p, 2);
+
+    r->headers_in      = apr_table_make(r->pool, 1);
+    r->trailers_in     = apr_table_make(r->pool, 1);
+    r->subprocess_env  = apr_table_make(r->pool, 25);
+    r->headers_out     = apr_table_make(r->pool, 12);
+    r->err_headers_out = apr_table_make(r->pool, 5);
+    r->trailers_out    = apr_table_make(r->pool, 1);
+    r->notes           = apr_table_make(r->pool, 5);
+
+    r->request_config  = ap_create_request_config(r->pool);
+    /* Must be set before we run create request hook */
+
+    r->sent_bodyct     = 0;                      /* bytect isn't for body */
+
+    r->read_length     = 0;
+    r->read_body       = REQUEST_NO_BODY;
+
+    r->status          = HTTP_OK;  /* Until further notice */
+    r->the_request     = NULL;
+
+    /* Begin by presuming any module can make its own path_info assumptions,
+     * until some module interjects and changes the value.
+     */
+    r->used_path_info = AP_REQ_DEFAULT_PATH_INFO;
+
+
+    /* Time to populate r with the data we have. */
+    r->method = method;
+    /* Provide quick information about the request method as soon as known */
+    r->method_number = ap_method_number_of(r->method);
+    if (r->method_number == M_OPTIONS
+            || (r->method_number == M_GET && r->method[0] == 'H')) {
+        r->header_only = 1;
+    }
+    else {
+        r->header_only = 0;
+    }
+    r->protocol = "HTTP/1.0";
+    r->proto_num = HTTP_VERSION(1, 0);
+    if ( protocol && (protocol[7] == '1') ) {
+        r->protocol = "HTTP/1.1";
+        r->proto_num = HTTP_VERSION(1, 1);
+    }
+    r->hostname = NULL;
+    r->connection = apr_pcalloc(p, sizeof(conn_rec));
+    r->connection->log_id = "-";
+    r->connection->conn_config = ap_create_conn_config(p);
+
+    return r;
 }
 
-static void addworkersfromtable(struct proxy_node_table *node_table)
+static void addworkersfromtable(struct proxy_node_table *node_table, apr_pool_t *p, server_rec *s, proxy_balancer *balancer)
 {
     /* Calls mod_manager_manage_worker */
+    struct proxy_node_table *ctable = node_table;
+    while (ctable) {
+        if (!ctable->alreadyin) {
+            request_rec *r;
+            r = create_request_rec(p, s, balancer, "GET", "http" );
+            mod_manager_manage_worker(r, ctable->host, balancer->s->name);
+        }
+        ctable = ctable->next;
+    }
+}
+static void remove_worker(apr_pool_t *p, server_rec *s, proxy_balancer *balancer, const char *hostname)
+{
+    request_rec *r;
+    apr_table_t *params;
+    r = create_request_rec(p, s, balancer, "GET", "http" );
+    apr_table_set(params, "b", balancer->s->name);
+    apr_table_set(params, "w",
+                  apr_pstrcat(r->pool, Type, "://", hostname, ":", Port, NULL));
+    apr_table_set(params, "w_status_D", "1"); /* Dissabled */
+    apr_table_set(params, "w_status_S", "1"); /* Stopped */
+
+    balancer_manage(r, params);
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, "remove_worker: %s removed", hostname);
 }
 
 /* check if the worker is in the pod list otherwise add it to the toremove list */
-static int isworkerintable(apr_pool_t *pool, proxy_worker *worker, struct proxy_node_table *node_table, struct proxy_worker_table *worker_table) {
+static int isworkerintable(apr_pool_t *pool, proxy_worker *worker, struct proxy_node_table *node_table) 
+{
     struct proxy_node_table *ctable = node_table;
-    struct proxy_worker_table *cworkertable = worker_table;
     int intable = 0;
     while (ctable) {
-        if (!strcpy(ctable->host, worker->s->hostname)) {
+        if (!strcmp(ctable->host, worker->s->hostname)) {
              ctable->alreadyin = 1;
              return 1;
         }
         ctable = ctable->next;
     }
     /* here the worker is NOT in the node table */
-    if (!cworkertable) {
-       cworkertable = apr_pcalloc(pool, sizeof(struct proxy_worker_table));
-       worker_table = cworkertable;
-       cworkertable->worker = worker; 
-    } else {
-       while (cworkertable->next)
-            cworkertable = cworkertable->next;
-       cworkertable->next = apr_pcalloc(pool, sizeof(struct proxy_worker_table));
-       cworkertable = cworkertable->next; 
-       cworkertable->worker = worker;
-    }
     return 0;
 }
 
@@ -155,7 +240,6 @@ static apr_status_t k8s_watchdog_callback(int state, void *data, apr_pool_t *poo
 
     case AP_WATCHDOG_STATE_RUNNING:
         /* loop thru all workers */
-        struct proxy_worker_table *worker_table = NULL;
         int i;
         void *sconf = s->module_config;
         proxy_server_conf *conf = (proxy_server_conf *)ap_get_module_config(sconf, &proxy_module);
@@ -175,17 +259,18 @@ static apr_status_t k8s_watchdog_callback(int state, void *data, apr_pool_t *poo
             workers = (proxy_worker **)balancer->workers->elts;
             for (n = 0; n < balancer->workers->nelts; n++) {
                 worker = *workers;
-                if (!isworkerintable(pool, worker, node_table, worker_table)) {
-                    /* We have to remove it or marke as REMOVED */
+                if (!isworkerintable(pool, worker, node_table)) {
+                    /* We have to remove it or marked as REMOVED */
+                    remove_worker(pool, s, balancer, worker->s->name);
                 }
                 workers++;
             }
             /* add the new pods */
-            addworkersfromtable(node_table);
+            node_table = apr_pcalloc(pool, sizeof(struct proxy_node_table));
+            node_table->host = apr_pstrdup(pool, "10.131.0.33");
+            addworkersfromtable(node_table, pool, s, balancer);
         }
 
-        /* cleanup removed node in shared memory */
-        remove_removed_node(s, pool, now, worker_table);
         break;
 
     case AP_WATCHDOG_STATE_STOPPING:

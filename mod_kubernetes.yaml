@@ -8,7 +8,7 @@ spec:
   containers:
   - name: kubernetes-pause
     image: quay.io/jfclere/fedora
-    command:
-    - mod_kubernetes
-    - tomcat
+#    command:
+#    - mod_kubernetes
+#    - tomcat
 
